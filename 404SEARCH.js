@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         Shikimori Advanced Search (GraphQL)
-// @version      1.0
+// @version      1.1
 // @description  Performs a simultaneous GraphQL search and prepends results to the search box.
 // @match        https://shikimori.one/*
+// @match        https://shiki.one/*
 // @author       404FT
 // @updateURL    https://raw.githubusercontent.com/404FT/404SEARCH/refs/heads/main/404SEARCH.js
 // @downloadURL  https://raw.githubusercontent.com/404FT/404SEARCH/refs/heads/main/404SEARCH.js
