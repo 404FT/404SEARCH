@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Shikimori Advanced Search (GraphQL)
-// @version      1.2
+// @version      1.3
 // @description  Performs a simultaneous GraphQL search and prepends results to the search box.
 // @match        https://shikimori.one/*
 // @match        https://shiki.one/*
 // @match        https://shikimori.io/*
 // @author       404FT
-// @updateURL    https://raw.githubusercontent.com/404FT/404SEARCH/refs/heads/main/404SEARCH.js
-// @downloadURL  https://raw.githubusercontent.com/404FT/404SEARCH/refs/heads/main/404SEARCH.js
+// @updateURL    https://raw.githubusercontent.com/404FT/404SEARCH/refs/heads/main/404SEARCH.user.js
+// @downloadURL  https://raw.githubusercontent.com/404FT/404SEARCH/refs/heads/main/404SEARCH.user.js
 // @license      MIT
 // @grant        GM_xmlhttpRequest
 // ==/UserScript==
@@ -19,7 +19,9 @@
     const CONFIG = {
         DEBUG_MODE: true,
         GRAPHQL_URL: '/api/graphql',
-        DEBOUNCE_MS: 300
+        DEBOUNCE_MS: 300,
+        MAX_RESULTS_PER_CATEGORY: 8,
+        FINAL_LIMIT: 5
     };
 
     // --- STATE MANAGEMENT ---
@@ -32,40 +34,25 @@
 
     // --- DICTIONARIES (Localization) ---
     const KIND_MAP = {
-      tv: "TV Сериал",
-      movie: "Фильм",
-      ova: "OVA",
-      ona: "ONA",
-      special: "Спецвыпуск",
-      tv_special: "TV Спецвыпуск",
-      music: "Клип",
-      pv: "PV",
-      cm: "CM",
-      manga: "Манга",
-      manhwa: "Манхва",
-      manhua: "Маньхуа",
-      novel: "Ранобэ",
-      one_shot: "Ваншот",
-      doujin: "Додзинси",
+        tv: "TV Сериал", movie: "Фильм", ova: "OVA", ona: "ONA",
+        special: "Спецвыпуск", tv_special: "TV Спецвыпуск", music: "Клип",
+        pv: "PV", cm: "CM", manga: "Манга", manhwa: "Манхва", manhua: "Маньхуа",
+        novel: "Ранобэ", one_shot: "Ваншот", doujin: "Додзинси"
     };
 
     const STATUS_MAP = {
-      released: "вышло",
-      ongoing: "онгоинг",
-      anons: "анонс",
-      paused: "приостановлено",
-      discontinued: "прекращено",
+        released: "вышло",
+        ongoing: "онгоинг",
+        anons: "анонс",
+        paused: "приостановлено",
+        discontinued: "прекращено"
     };
 
-    // For manga specifically, status text varies slightly in UI ("издано" vs "вышло")
-    // but we will use a generic map or specific overrides in the builder.
-
     // --- GRAPHQL QUERIES ---
-
     const QUERIES = {
         anime: `query($search: String) {
-            animes(search: $search, limit: 5, censored: false) {
-                id name russian url kind status
+            animes(search: $search, limit: ${CONFIG.MAX_RESULTS_PER_CATEGORY}, censored: false) {
+                id name russian english synonyms url kind status
                 airedOn { year }
                 studios { name }
                 genres { id name russian }
@@ -73,8 +60,8 @@
             }
         }`,
         manga: `query($search: String) {
-            mangas(search: $search, limit: 5, censored: false) {
-                id name russian url kind status
+            mangas(search: $search, limit: ${CONFIG.MAX_RESULTS_PER_CATEGORY}, censored: false) {
+                id name russian english synonyms url kind status
                 airedOn { year }
                 publishers { name }
                 genres { id name russian }
@@ -82,8 +69,8 @@
             }
         }`,
         ranobe: `query($search: String) {
-            mangas(search: $search, limit: 5, censored: false, kind: "novel") {
-                id name russian url kind status
+            mangas(search: $search, limit: ${CONFIG.MAX_RESULTS_PER_CATEGORY}, censored: false, kind: "novel") {
+                id name russian english synonyms url kind status
                 airedOn { year }
                 publishers { name }
                 genres { id name russian }
@@ -91,15 +78,15 @@
             }
         }`,
         character: `query($search: String) {
-            characters(search: $search, limit: 5) {
-                id name russian url
+            characters(search: $search, limit: ${CONFIG.MAX_RESULTS_PER_CATEGORY}) {
+                id name russian english synonyms url
                 poster { miniUrl mainUrl }
                 isAnime isManga isRanobe
             }
         }`,
         person: `query($search: String) {
-            people(search: $search, limit: 5) {
-                id name russian url
+            people(search: $search, limit: ${CONFIG.MAX_RESULTS_PER_CATEGORY}) {
+                id name russian english synonyms url
                 poster { miniUrl mainUrl }
                 isSeyu isMangaka isProducer
             }
@@ -121,28 +108,44 @@
         try {
             const response = await fetch(CONFIG.GRAPHQL_URL, {
                 method: 'POST',
-                headers: headers,
-                body: JSON.stringify({
-                    query: query,
-                    variables: { search: searchTerm }
-                }),
+                headers,
+                body: JSON.stringify({ query, variables: { search: searchTerm } }),
                 signal: activeRequestController.signal
             });
 
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const json = await response.json();
-            debug(json);
+            debug('GraphQL response:', json);
             return json.data;
         } catch (e) {
-            if (e.name !== 'AbortError') console.error(e);
+            if (e.name !== 'AbortError') console.error('[AdvSrch] Fetch error:', e);
             return null;
         }
     };
 
-    // --- HTML BUILDERS ---
+    // --- РЕЛЕВАНТНОСТЬ (учитываем синонимы и альтернативные названия) ---
+    function getRelevanceScore(item, termLower) {
+        let score = 0;
+        const titles = [
+            (item.russian || '').toLowerCase(),
+            (item.name || '').toLowerCase(),
+            (item.english || '').toLowerCase(),
+            ...(item.synonyms || []).map(s => s.toLowerCase())
+        ];
 
+        for (const title of titles) {
+            if (!title) continue;
+            if (title === termLower) score += 20;
+            else if (title.startsWith(termLower)) score += 12;
+            else if (title.includes(termLower)) score += 8;
+        }
+
+        return score;
+    }
+
+    // --- HTML BUILDERS ---
     const buildAnimeHTML = (item) => {
-        const titleRu = item.russian || item.name;
+        const titleRu = item.russian || item.name || item.english || '???';
         const url = item.url;
         const kindLabel = KIND_MAP[item.kind] || item.kind;
         const year = item.airedOn?.year ? `${item.airedOn.year} год` : '';
@@ -152,7 +155,8 @@
         const genresHtml = (item.genres || []).slice(0, 3).map(g => `
             <div class="b-tag" data-href="https://shikimori.one/animes/genre/${g.id}-${g.name}">
                 <span class="genre-en">${g.name}</span><span class="genre-ru">${g.russian}</span>
-            </div>`).join('');
+            </div>
+        `).join('');
 
         let metaLine = `<div class="b-tag">${kindLabel}</div>`;
         if (year) metaLine += `<div class="b-tag">${year}</div>`;
@@ -171,18 +175,18 @@
     };
 
     const buildMangaHTML = (item) => {
-        const titleRu = item.russian || item.name;
+        const titleRu = item.russian || item.name || item.english || '???';
         const url = item.url;
         const kindLabel = KIND_MAP[item.kind] || 'Манга';
         const year = item.airedOn?.year ? `${item.airedOn.year} год` : '';
         const publisher = item.publishers?.[0]?.name || '';
-        // Manga status text often differs in UI ("издано" instead of "вышло"), but we use standard map for simplicity or override
         const statusLabel = item.status === 'released' ? 'издано' : (STATUS_MAP[item.status] || item.status);
 
         const genresHtml = (item.genres || []).slice(0, 3).map(g => `
             <div class="b-tag" data-href="https://shikimori.one/mangas/genre/${g.id}-${g.name}">
                 <span class="genre-en">${g.name}</span><span class="genre-ru">${g.russian}</span>
-            </div>`).join('');
+            </div>
+        `).join('');
 
         let metaLine = `<div class="b-tag">${kindLabel}</div>`;
         if (year) metaLine += `<div class="b-tag">${year}</div>`;
@@ -201,21 +205,16 @@
     };
 
     const buildCharacterHTML = (item) => {
-        const titleRu = item.russian || item.name;
+        const titleRu = item.russian || item.name || item.english || '???';
         const url = item.url;
-
-        // Subtitle Logic
         const types = [];
         if (item.isAnime) types.push('аниме');
         if (item.isManga) types.push('манги');
         if (item.isRanobe) types.push('ранобэ');
 
         let subtitle = 'Персонаж';
-        if (types.length > 0) {
-            const joined = types.length > 1
-                ? types.slice(0, -1).join(', ') + ' и ' + types.slice(-1)
-                : types[0];
-            subtitle += ` ${joined}`;
+        if (types.length) {
+            subtitle += ` ${types.length > 1 ? types.slice(0, -1).join(', ') + ' и ' + types[types.length-1] : types[0]}`;
         }
 
         return `
@@ -229,14 +228,12 @@
     };
 
     const buildPersonHTML = (item) => {
-        const titleRu = item.russian || item.name;
+        const titleRu = item.russian || item.name || item.english || '???';
         const url = item.url;
-
-        // Priority based Subtitle Logic (simplified based on UI examples)
-        let subtitle = 'Участник проекта'; // Fallback
+        let subtitle = 'Участник проекта';
         if (item.isSeyu) subtitle = 'Сэйю';
         else if (item.isMangaka) subtitle = 'Автор манги';
-        else if (item.isProducer) subtitle = 'Режиссёр/Продюсер'; // UI often says specific role, but we only have boolean
+        else if (item.isProducer) subtitle = 'Режиссёр / Продюсер';
 
         return `
         <a class="b-db_entry-variant-list_item" data-id="${item.id}" href="${url}" data-adv="true">
@@ -249,7 +246,6 @@
     };
 
     // --- MAIN SEARCH LOGIC ---
-
     const performSearch = async (container, input) => {
         const term = input.value.trim();
         if (!term) {
@@ -258,61 +254,64 @@
             return;
         }
 
-        // Determine Mode
-        // Shikimori sets 'active' class on .search-mode div
+        // Определяем режим поиска
         const modeEl = container.querySelector('.search-mode.active') || container.querySelector('.search-mode');
-        let mode = modeEl ? modeEl.dataset.mode : 'anime';
+        let mode = modeEl?.dataset.mode || 'anime';
+        if (!['anime', 'manga', 'ranobe', 'character', 'person'].includes(mode)) mode = 'anime';
 
-        // Default to anime if mode logic fails, but try to detect based on global context if possible
-        // The HTML provided shows data-mode="anime" etc. inside .inner div usually before search starts
-        if (!['anime', 'manga', 'ranobe', 'character', 'person'].includes(mode)) {
-            mode = 'anime';
-        }
+        debug(`Поиск "${term}" в режиме "${mode}"`);
 
-        debug(`Searching '${term}' in mode '${mode}'`);
-
-        let query = QUERIES[mode];
-        // Ranobe shares 'manga' structure usually but we have a dedicated query const
-        if (mode === 'ranobe') query = QUERIES.ranobe;
-
+        const query = QUERIES[mode];
         const data = await fetchGraphQL(query, term);
 
-        if (data) {
-            let items = [];
-            if (data.animes) items = data.animes.map(buildAnimeHTML);
-            else if (data.mangas) items = data.mangas.map(buildMangaHTML);
-            else if (data.characters) items = data.characters.map(buildCharacterHTML);
-            else if (data.people) items = data.people.map(buildPersonHTML);
+        if (!data) {
+            cachedResultsHTML = '';
+            renderResults(container);
+            return;
+        }
 
-            if (items.length > 0) {
-                const resultsHtml = items.join('');
-                // Header + Results + Separator
-                cachedResultsHTML = `
-                    <div class="adv-results-group">
-                        <div class="adv-result-label" style="padding: 5px 10px; font-size: 0.8em; opacity: 0.6;">GraphQL Results:</div>
-                        ${resultsHtml}
-                    </div>
-                    <div class="adv-separator" style="height: 15px; border-bottom: 1px dashed rgba(127,127,127,0.2); margin-bottom: 10px;"></div>
-                `;
-            } else {
-                cachedResultsHTML = '';
-            }
+        let items = [];
+        if (data.animes) items = data.animes;
+        else if (data.mangas) items = data.mangas;
+        else if (data.characters) items = data.characters;
+        else if (data.people) items = data.people;
+
+        const termLower = term.toLowerCase();
+
+        // Сортируем по релевантности (учитываем синонимы)
+        items.sort((a, b) => getRelevanceScore(b, termLower) - getRelevanceScore(a, termLower));
+
+        // Берём только топ-N
+        items = items.slice(0, CONFIG.FINAL_LIMIT);
+
+        let resultsHtml = '';
+        if (items.length > 0) {
+            if (mode === 'anime')      resultsHtml = items.map(buildAnimeHTML).join('');
+            else if (mode === 'manga' || mode === 'ranobe') resultsHtml = items.map(buildMangaHTML).join('');
+            else if (mode === 'character') resultsHtml = items.map(buildCharacterHTML).join('');
+            else if (mode === 'person')    resultsHtml = items.map(buildPersonHTML).join('');
+
+            cachedResultsHTML = `
+                <div class="adv-results-group">
+                    <div class="adv-result-label" style="padding: 5px 10px; font-size: 0.8em; opacity: 0.6;">GraphQL Results:</div>
+                    ${resultsHtml}
+                </div>
+                <div class="adv-separator" style="height: 15px; border-bottom: 1px dashed rgba(127,127,127,0.2); margin-bottom: 10px;"></div>
+            `;
+        } else {
+            cachedResultsHTML = '';
         }
 
         renderResults(container);
     };
 
     // --- DOM MANIPULATION ---
-
     const renderResults = (container) => {
         const wrapperId = 'adv-search-wrapper';
         let wrapper = container.querySelector(`#${wrapperId}`);
 
-        // Check if the native "Search Categories" are visible.
-        // If '.search-mode' elements exist, the user is NOT searching (or has cleared input/blurred), so hide or remove results.
-        const isSearchModeActive = container.querySelector('.search-mode');
-
-        if (!cachedResultsHTML || isSearchModeActive) {
+        // Если видим режимы поиска (не в процессе поиска) → убираем результаты
+        if (container.querySelector('.search-mode') || !cachedResultsHTML) {
             if (wrapper) wrapper.remove();
             return;
         }
@@ -321,79 +320,55 @@
             wrapper = document.createElement('div');
             wrapper.id = wrapperId;
             container.prepend(wrapper);
-        } else {
-            // If it exists, ensure it is the first child
-            if (container.firstElementChild !== wrapper) {
-                container.prepend(wrapper);
-            }
         }
-        
-        // Only update innerHTML if it changed
+
         if (wrapper.innerHTML !== cachedResultsHTML) {
             wrapper.innerHTML = cachedResultsHTML;
         }
     };
 
     // --- INITIALIZATION & EVENTS ---
-
     let observerInstance = null;
 
     const attachSearchListener = (resultsInner, inputField) => {
-        // Prevent attaching multiple listeners to the same element
         if (resultsInner.dataset.advAttached === 'true') return;
         resultsInner.dataset.advAttached = 'true';
 
-        // 1. Input Listener (Debounced search)
         let debounceTimer;
         inputField.addEventListener('input', () => {
             clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(() => {
-                performSearch(resultsInner, inputField);
-            }, CONFIG.DEBOUNCE_MS);
+            debounceTimer = setTimeout(() => performSearch(resultsInner, inputField), CONFIG.DEBOUNCE_MS);
         });
 
-        // 2. Observer (Keeps results on top, removes them if Search Mode resets)
-        const observer = new MutationObserver(() => {
-            renderResults(resultsInner);
-        });
-        
-        observer.observe(resultsInner, { childList: true });
+        const observer = new MutationObserver(() => renderResults(resultsInner));
+        observer.observe(resultsInner, { childList: true, subtree: true });
     };
 
     const init = () => {
-        // Disconnect previous observer to prevent duplicates/memory leaks
-        if (observerInstance) {
-            observerInstance.disconnect();
-            observerInstance = null;
-        }
+        if (observerInstance) observerInstance.disconnect();
 
         observerInstance = new MutationObserver(() => {
             const globalSearch = document.querySelector('.global-search');
-            if (globalSearch) {
-                const input = globalSearch.querySelector('input');
-                const innerResults = globalSearch.querySelector('.search-results .inner');
-                
-                if (input && innerResults) {
-                    attachSearchListener(innerResults, input);
-                }
+            if (!globalSearch) return;
+
+            const input = globalSearch.querySelector('input');
+            const inner = globalSearch.querySelector('.search-results .inner');
+
+            if (input && inner) {
+                attachSearchListener(inner, input);
             }
         });
 
-        if (document.body) {
-            observerInstance.observe(document.body, { childList: true, subtree: true });
-        }
-        
-        log("Initialized!");
+        observerInstance.observe(document.body, { childList: true, subtree: true });
+        log("Скрипт запущен (v1.3)");
     };
 
-    // --- STARTUP ---
-    // 1. Run immediately if page is ready
-    if (document.readyState === "complete" || document.readyState === "interactive") {
+    // Запуск
+    if (document.readyState === 'complete' || document.readyState === 'interactive') {
         init();
     } else {
         document.addEventListener('DOMContentLoaded', init);
     }
-    
-    // 2. Re-run on Turbolinks navigation (Page change without refresh)
+
     document.addEventListener('turbolinks:load', init);
 })();
